@@ -1,367 +1,463 @@
 from flask import Flask, request, jsonify
-from flask_cors import CORS
 import pandas as pd
 import numpy as np
 import re
+import scipy.linalg as la
+from flask_cors import CORS
+
+from flask import render_template
 
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # Enable CORS for all routes
 
+# Helper functions from original script
+def create_distance_matrix(df):
+    """Create a distance matrix from the dataframe"""
+    n = len(df)
+    distance_matrix = np.zeros((n, n))
+    for i in range(n):
+        distance_matrix[i, i] = df['Distances_Km'].iloc[i]
+    return distance_matrix
 
-class AdjustmentCalculator:
-    """Handles all adjustment calculations with frontend-compatible output"""
-    
-    def __init__(self, df, benchmarks, formulas):
-        self.df = df
-        self.benchmarks = benchmarks
-        self.formulas = formulas
-        self.n = len(df)
-        
-    def create_distance_matrix(self):
-        """Create diagonal distance matrix"""
-        return np.diag(self.df['Distances_Km'].values)
-    
-    @staticmethod
-    def modify_equation(formula):
-        """Convert formula to standard format with V variables"""
-        parts = formula.replace('-', ' -').replace('+', ' +').split()
-        result = []
-        
-        for part in parts:
-            if part in ['+', '-']:
-                continue
-                
-            operator = ''
-            if part.startswith(('+', '-')):
-                operator = part[0]
-                part = part[1:]
-            
-            if operator:
-                result.append(operator)
-            
-            if re.match(r'[hH]\d+', part):
-                var_index = re.match(r'[hH](\d+)', part).group(1)
-                result.append(f'V{var_index} + {part}')
-            elif '=' in part:
+def modify_equation(formula):
+    """Modify equation to standard format"""
+    parts = formula.replace('-', ' -').replace('+', ' +').split()
+    result = []
+
+    for part in parts:
+        if part in ['+', '-']:
+            result.append(part)
+            continue
+
+        operator = ''
+        if part.startswith('+') or part.startswith('-'):
+            operator = part[0]
+            part = part[1:]
+            result.append(operator)
+
+        if re.match(r'[hH]\d+', part):
+            var_match = re.match(r'([hH])(\d+)', part)
+            var_index = var_match.group(2)
+            result.append(f'V{var_index} + {part}')
+        else:
+            if '=' in part:
                 left, right = part.split('=', 1)
                 if re.match(r'[hH]\d+', left):
-                    var_index = re.match(r'[hH](\d+)', left).group(1)
+                    var_match = re.match(r'([hH])(\d+)', left)
+                    var_index = var_match.group(2)
                     result.append(f'V{var_index} + {left}={right}')
                 else:
                     result.append(part)
             else:
                 result.append(part)
-        
-        return ' '.join(result)
+
+    return ' '.join(result)
+
+def extract_coefficients(modified_eqn):
+    """Extract coefficients from the modified equation"""
+    coefficients = {}
+    matches = re.finditer(r'([+-]?)\s*V(\d+)', modified_eqn)
+    for match in matches:
+        sign = match.group(1) or '+'
+        var_index = int(match.group(2))
+        coefficients[var_index] = f"{sign}1"
+    return coefficients
+
+def convert_coefficient_to_numeric(coeff_str):
+    """Convert coefficient string to numeric value"""
+    if coeff_str == '0':
+        return 0
+    elif coeff_str.startswith('+'):
+        return 1
+    elif coeff_str.startswith('-'):
+        return -1
+    else:
+        return int(coeff_str)
+
+def transpose_coefficient_matrix(coefficient_matrix):
+    """Transpose a coefficient matrix"""
+    equation_names = [row[0] for row in coefficient_matrix]
+    num_cols = len(coefficient_matrix[0]) - 1
+    transposed_matrix = [["Parameter"] + equation_names]
     
-    @staticmethod
-    def extract_coefficients(equation, num_vars):
-        """Extract coefficient vector from equation"""
-        coeffs = {}
-        matches = re.finditer(r'([+-]?)\s*V(\d+)', equation)
-        
-        for match in matches:
-            sign = match.group(1) or '+'
-            var_index = int(match.group(2))
-            coeffs[var_index] = sign + '1'
-        
-        return coeffs
+    for j in range(1, num_cols + 1):
+        new_row = [f"V{j}"]
+        for i in range(len(coefficient_matrix)):
+            new_row.append(coefficient_matrix[i][j])
+        transposed_matrix.append(new_row)
     
-    def build_coefficient_table(self):
-        """Build coefficient table for frontend compatibility"""
-        table = []
-        modified_eqns = []
-        
-        for i, formula in enumerate(self.formulas):
-            modified = self.modify_equation(formula)
-            modified_eqns.append(modified)
-            coeffs = self.extract_coefficients(modified, self.n)
-            row = [f"Eqn {i+1}"] + [coeffs.get(j, '0') for j in range(1, self.n + 1)]
-            table.append(row)
-        
-        return table, modified_eqns
+    return transposed_matrix
+
+def multiply_coefficients_with_distances(coefficient_table, distance_matrix):
+    """Multiply coefficients with distances"""
+    result_table = []
+    for row in coefficient_table:
+        equation_name = row[0]
+        coefficients = row[1:]
+        numeric_coeffs = [convert_coefficient_to_numeric(c) for c in coefficients]
+        result_row = [equation_name]
+        for i, coeff in enumerate(numeric_coeffs):
+            if coeff != 0:
+                weighted_coeff = coeff * distance_matrix[i, i]
+                result_row.append(f"+{weighted_coeff:.3f}" if weighted_coeff > 0 else f"{weighted_coeff:.3f}")
+            else:
+                result_row.append("0")
+        result_table.append(result_row)
+    return result_table
+
+def multiply_result_table_with_transpose(result_table):
+    """Multiply the result table with its transpose"""
+    numeric_matrix = []
+    equation_names = []
     
-    def calculate_w_values(self):
-        """Calculate misclosure vector w"""
-        w_values = []
-        
-        for formula in self.formulas:
-            formula = formula.replace('hh', 'h')
-            parts = formula.split('=')
-            
-            if len(parts) != 2:
-                continue
-            
-            left_val = self._evaluate_side(parts[0])
-            right_val = self._evaluate_side(parts[1])
-            
-            w_values.append(-(right_val - left_val))
-        
-        return w_values
-    
-    def _evaluate_side(self, expression):
-        """Evaluate one side of equation"""
-        value = 0
-        terms = re.findall(r'([+-]?)([hHbB])(\d+)', expression)
-        
-        for sign, var_type, idx in terms:
-            multiplier = -1 if sign == '-' else 1
-            idx = int(idx) - 1
-            
-            if var_type.lower() == 'h' and idx < len(self.df):
-                value += multiplier * self.df['h_obs'].iloc[idx]
-            elif var_type.upper() == 'B' and idx < len(self.benchmarks):
-                value += multiplier * self.benchmarks[idx]
-        
-        if not terms and expression.strip():
+    for row in result_table:
+        equation_names.append(row[0])
+        numeric_values = []
+        for val in row[1:-1]:  # Exclude the last column (w values)
             try:
-                value = eval(expression.strip())
-            except:
-                pass
-        
-        return value
+                numeric_values.append(float(val.replace('+', '')))
+            except ValueError:
+                numeric_values.append(0.0)
+        numeric_matrix.append(numeric_values)
     
-    def format_value(self, val, decimals=3):
-        """Format value with + prefix for positive numbers"""
-        if abs(val) < 1e-10:
-            return "0"
-        formatted = f"{val:.{decimals}f}"
-        return f"+{formatted}" if val > 0 else formatted
+    transpose = [[numeric_matrix[j][i] for j in range(len(numeric_matrix))] 
+                for i in range(len(numeric_matrix[0]))]
     
-    def multiply_coefficients_with_distances(self, coeff_table, distance_matrix):
-        """Multiply coefficients with distances"""
-        result_table = []
+    product = []
+    for i in range(len(numeric_matrix)):
+        product_row = []
+        for j in range(len(numeric_matrix)):
+            dot_product = sum(numeric_matrix[i][k] * transpose[k][j] 
+                             for k in range(len(transpose)))
+            product_row.append(dot_product)
+        product.append(product_row)
+    
+    product_table = []
+    for i, row in enumerate(product):
+        formatted_row = [equation_names[i]]
+        for val in row:
+            if val == 0:
+                formatted_row.append("0")
+            else:
+                formatted_row.append(f"+{val:.4f}" if val > 0 else f"{val:.4f}")
+        product_table.append(formatted_row)
+    
+    return product_table
+
+def calculate_inverse_of_product_table(product_table):
+    """Calculate the inverse of the product table"""
+    equation_names = [row[0] for row in product_table]
+    numeric_matrix = []
+    
+    for row in product_table:
+        numeric_values = []
+        for val in row[1:]:
+            try:
+                numeric_values.append(float(val.replace('+', '')))
+            except ValueError:
+                numeric_values.append(0.0)
+        numeric_matrix.append(numeric_values)
+    
+    numeric_matrix = np.array(numeric_matrix)
+    
+    try:
+        inverse_matrix = np.linalg.inv(numeric_matrix)
         
-        for row in coeff_table:
-            eqn_name = row[0]
-            coeffs = [int(c.replace('+', '')) if c != '0' else 0 for c in row[1:]]
-            
-            result_row = [eqn_name]
-            for i, coeff in enumerate(coeffs):
-                if coeff != 0:
-                    weighted = coeff * distance_matrix[i, i]
-                    result_row.append(self.format_value(weighted))
+        inverse_table = []
+        for i, row in enumerate(inverse_matrix):
+            formatted_row = [equation_names[i]]
+            for val in row:
+                if abs(val) < 1e-10:
+                    formatted_row.append("0")
                 else:
-                    result_row.append("0")
+                    formatted_row.append(f"+{val:.4f}" if val >= 0 else f"{val:.4f}")
+            inverse_table.append(formatted_row)
+        
+        return inverse_table
+    
+    except np.linalg.LinAlgError as e:
+        return None
+
+def multiply_inverse_table_with_w(inverse_table, w_values):
+    """Multiply the negative inverse of the product table with the w values"""
+    if inverse_table is None:
+        return None
+    
+    w_values = np.array(w_values, dtype=float)
+    inverse_matrix = []
+    
+    for row in inverse_table:
+        numeric_values = []
+        for val in row[1:]:
+            try:
+                numeric_values.append(float(val.replace('+', '')))
+            except ValueError:
+                numeric_values.append(0.0)
+        inverse_matrix.append(numeric_values)
+    
+    inverse_matrix = np.array(inverse_matrix)
+    negative_inverse_matrix = -inverse_matrix
+    result = np.dot(negative_inverse_matrix, w_values)
+    
+    formatted_result = []
+    for i, val in enumerate(result):
+        if abs(val) < 1e-10:
+            formatted_result.append(["K" + str(i+1), "0"])
+        else:
+            formatted_result.append(["K" + str(i+1), f"+{val:.4f}" if val >= 0 else f"{val:.4f}"])
+    
+    return formatted_result
+
+def calculate_w_values(formulas, df, benchmarks):
+    """Calculate w values by evaluating condition equations using h_obs values"""
+    w_values = []
+    
+    for formula in formulas:
+        formula = formula.replace('hh', 'h')
+        parts = formula.split('=')
+        
+        if len(parts) != 2:
+            continue
             
-            result_table.append(result_row)
+        left, right = parts
+        left_val = 0
+        right_val = 0
         
-        return result_table
+        # Process left side
+        terms = re.findall(r'([+-]?)([hHbB])(\d+)', left)
+        for sign, var_type, idx in terms:
+            sign = sign if sign else '+'
+            idx = int(idx)
+            multiplier = 1 if sign == '+' else -1
+            
+            if var_type.lower() == 'h':
+                if idx <= len(df):
+                    left_val += multiplier * df['h_obs'].iloc[idx-1]
+            elif var_type.upper() == 'B':
+                if idx <= len(benchmarks):
+                    left_val += multiplier * benchmarks[idx-1]
+        
+        # Process right side
+        terms = re.findall(r'([+-]?)([hHbB])(\d+)', right)
+        for sign, var_type, idx in terms:
+            sign = sign if sign else '+'
+            idx = int(idx)
+            multiplier = 1 if sign == '+' else -1
+            
+            if var_type.lower() == 'h':
+                if idx <= len(df):
+                    right_val += multiplier * df['h_obs'].iloc[idx-1]
+            elif var_type.upper() == 'B':
+                if idx <= len(benchmarks):
+                    right_val += multiplier * benchmarks[idx-1]
+        
+        # If the right side is a number, use that value
+        if not terms and right.strip():
+            try:
+                right_val = eval(right.strip())
+            except:
+                try:
+                    # Handle expressions like B2-B1
+                    right = right.replace('B1', str(benchmarks[0])).replace('B2', str(benchmarks[1]))
+                    right_val = eval(right)
+                except:
+                    pass
+        
+        # Calculate the w value
+        w_value = -1 * (right_val - left_val)
+        w_values.append(w_value)
     
-    def transpose_coefficient_table(self, coeff_table):
-        """Transpose coefficient table"""
-        eqn_names = [row[0] for row in coeff_table]
-        num_cols = len(coeff_table[0]) - 1
-        
-        transposed = [["Parameter"] + eqn_names]
-        for j in range(1, num_cols + 1):
-            row = [f"V{j}"] + [coeff_table[i][j] for i in range(len(coeff_table))]
-            transposed.append(row)
-        
-        return transposed
+    return w_values
+
+def format_w_value(value):
+    """Format w value as string"""
+    if value == 0:
+        return "0"
+    formatted = f"{value:.3f}".rstrip('0').rstrip('.')
+    return formatted
+
+def calculate_residual(distance_matrix, coefficient_table, formatted_result):
+    """Calculate the residual values"""
+    numeric_matrix = []
     
-    def calculate_product_table(self, result_table):
-        """Calculate product table (A*P*A^T)"""
-        eqn_names = [row[0] for row in result_table]
-        
-        # Extract numeric matrix (exclude equation names and w column)
-        numeric_matrix = []
-        for row in result_table:
-            values = [float(val.replace('+', '')) for val in row[1:-1]]
-            numeric_matrix.append(values)
-        
-        matrix = np.array(numeric_matrix)
-        product = matrix @ matrix.T
-        
-        # Format as table
-        product_table = []
-        for i, row in enumerate(product):
-            formatted_row = [eqn_names[i]] + [self.format_value(val, 4) for val in row]
-            product_table.append(formatted_row)
-        
-        return product_table
+    for row in coefficient_table:
+        numeric_values = []
+        for val in row[1:]:
+            try:
+                numeric_values.append(float(val.replace('+', '')))
+            except ValueError:
+                numeric_values.append(0.0)
+        numeric_matrix.append(numeric_values)
     
-    def calculate_inverse_table(self, product_table):
-        """Calculate inverse of product table"""
-        eqn_names = [row[0] for row in product_table]
-        
-        # Extract numeric matrix
-        numeric_matrix = np.array([
-            [float(val.replace('+', '')) for val in row[1:]]
-            for row in product_table
-        ])
-        
+    numeric_matrix = np.array(numeric_matrix)
+    transpose_matrix = numeric_matrix.T
+    negative_P = -distance_matrix
+    intermediate_result = np.dot(negative_P, transpose_matrix)
+    
+    formatted_numeric = []
+    for row in formatted_result:
+        value = float(row[1].replace('+', ''))
+        formatted_numeric.append(-value)
+    
+    formatted_numeric = np.array(formatted_numeric)
+    residual_values = np.dot(intermediate_result, formatted_numeric)
+    
+    residual = []
+    for i, val in enumerate(residual_values):
+        if abs(val) < 1e-10:
+            residual.append(["Residual " + str(i+1), "0"])
+        else:
+            residual.append(["Residual " + str(i+1), f"+{val:.4f}" if val >= 0 else f"{val:.4f}"])
+    
+    return residual
+
+def calculate_adjusted_heights(df, residual):
+    """Calculate adjusted heights"""
+    residual_values = []
+    
+    for row in residual:
         try:
-            inverse = np.linalg.inv(numeric_matrix)
-            
-            inverse_table = []
-            for i, row in enumerate(inverse):
-                formatted_row = [eqn_names[i]] + [self.format_value(val, 4) for val in row]
-                inverse_table.append(formatted_row)
-            
-            return inverse_table
-        except np.linalg.LinAlgError:
-            return None
+            residual_values.append(float(row[1].replace('+', '')))
+        except ValueError:
+            residual_values.append(0.0)
     
-    def calculate_k_values(self, inverse_table, w_values):
-        """Calculate K values (Lagrange multipliers)"""
-        if inverse_table is None:
-            return None
-        
-        # Extract numeric inverse matrix
-        inverse_matrix = np.array([
-            [float(val.replace('+', '')) for val in row[1:]]
-            for row in inverse_table
-        ])
-        
-        # Calculate k = -N^(-1) * w
-        k = -inverse_matrix @ np.array(w_values)
-        
-        return [[f"K{i+1}", self.format_value(val, 4)] for i, val in enumerate(k)]
+    if len(residual_values) != len(df):
+        return None
     
-    def calculate_residuals(self, distance_matrix, coeff_table, k_values):
-        """Calculate residuals"""
-        # Extract coefficient matrix
-        A = np.array([
-            [int(c.replace('+', '')) if c != '0' else 0 for c in row[1:]]
-            for row in coeff_table
-        ])
-        
-        # Extract k values
-        k = np.array([float(row[1].replace('+', '')) for row in k_values])
-        
-        # Calculate v = -P * A^T * k
-        v = -distance_matrix @ A.T @ k
-        
-        return [[f"Residual {i+1}", self.format_value(val, 4)] for i, val in enumerate(v)]
+    adjusted_heights = []
+    for i in range(len(df)):
+        h_obs = df['h_obs'].iloc[i]
+        adjusted_height = h_obs + residual_values[i]
+        adjusted_heights.append([f"Adjusted Height {i+1}", f"{adjusted_height:.4f}"])
     
-    def calculate_adjusted_heights(self, residuals):
-        """Calculate adjusted heights"""
-        residual_values = [float(row[1].replace('+', '')) for row in residuals]
-        
-        adjusted = []
-        for i, (h_obs, v) in enumerate(zip(self.df['h_obs'], residual_values)):
-            adjusted_height = h_obs + v
-            adjusted.append([f"Adjusted Height {i+1}", f"{adjusted_height:.4f}"])
-        
-        return adjusted
-    
-    def perform_full_adjustment(self):
-        """Perform complete adjustment and return all results"""
-        # Build coefficient table
-        coeff_table, modified_eqns = self.build_coefficient_table()
-        
-        # Create distance matrix
-        P = self.create_distance_matrix()
-        
-        # Calculate w values
-        w_values = self.calculate_w_values()
-        
-        # Create weighted coefficient table
-        result_table = self.multiply_coefficients_with_distances(coeff_table, P)
-        
-        # Add w values to result table
-        for i, row in enumerate(result_table):
-            row.append(self.format_value(w_values[i], 3))
-        
-        # Transpose table
-        transposed_table = self.transpose_coefficient_table(coeff_table)
-        
-        # Calculate product table
-        product_table = self.calculate_product_table(result_table)
-        
-        # Calculate inverse
-        inverse_table = self.calculate_inverse_table(product_table)
-        
-        # Calculate K values
-        k_values = self.calculate_k_values(inverse_table, w_values)
-        
-        # Calculate residuals
-        residuals = None
-        adjusted_heights = None
-        
-        if k_values:
-            residuals = self.calculate_residuals(P, coeff_table, k_values)
-            if residuals:
-                adjusted_heights = self.calculate_adjusted_heights(residuals)
-        
-        return {
-            'modified_equations': modified_eqns,
-            'coefficient_table': coeff_table,
-            'result_table': result_table,
-            'transposed_table': transposed_table,
-            'product_table': product_table,
-            'inverse_table': inverse_table,
-            'v_table_from_inverse': k_values,
-            'residual': residuals,
-            'adjusted_heights': adjusted_heights,
-            'distance_matrix': P
-        }
+    return adjusted_heights
 
 
+
+# API Routes
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    return jsonify({"status": "ok"}), 200
-
+    """Health check endpoint"""
+    return jsonify({"status": "ok", "message": "API is running"}), 200
 
 @app.route('/api/adjustment', methods=['POST'])
 def perform_adjustment():
+    """Main endpoint for adjustment computation"""
     try:
         data = request.get_json()
         
-        # Validate input
-        required = ['benchmarks', 'observations', 'num_parameters', 'formulas']
-        if missing := [f for f in required if f not in data]:
-            return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
+        # Validate required fields
+        required_fields = ['benchmarks', 'observations', 'num_parameters', 'formulas']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({"error": f"Missing required field: {field}"}), 400
         
-        # Create DataFrame
-        df = pd.DataFrame(data['observations'])
+        # Process input data
+        benchmarks = data['benchmarks']
+        observations = data['observations']
+        num_parameters = data['num_parameters']
+        formulas = data['formulas']
         
-        # Validate columns
-        required_cols = ['Obs_No', 'Distances_Km', 'h_obs']
-        if missing_cols := [c for c in required_cols if c not in df.columns]:
-            return jsonify({"error": f"Missing columns: {', '.join(missing_cols)}"}), 400
+        # Create DataFrame from observations
+        df = pd.DataFrame(observations)
         
+        # Validate DataFrame columns
+        required_columns = ['Obs_No', 'Distances_Km', 'h_obs']
+        for col in required_columns:
+            if col not in df.columns:
+                return jsonify({"error": f"Missing column in observations: {col}"}), 400
+        
+        # Ensure data types
         df['Distances_Km'] = df['Distances_Km'].astype(float)
         df['h_obs'] = df['h_obs'].astype(float)
         
-        n = len(df)
-        m = data['num_parameters']
-        r = n - m
+        # Calculate the number of observations and condition equations
+        num_observations = len(df)
+        r = num_observations - num_parameters
         
-        # Validate condition equations
-        if r <= 0 and data['formulas']:
+        # Return error if no condition equations needed but formulas provided
+        if r <= 0 and formulas:
             return jsonify({"error": "No condition equations needed but formulas provided"}), 400
-        if r > 0 and len(data['formulas']) != r:
-            return jsonify({"error": f"Expected {r} condition equations but got {len(data['formulas'])}"}), 400
         
-        # Prepare base results
+        # Return error if condition equations needed but no formulas provided
+        if r > 0 and (not formulas or len(formulas) != r):
+            return jsonify({"error": f"Expected {r} condition equations but got {len(formulas) if formulas else 0}"}), 400
+        
+        # Perform calculations
+        distance_matrix = create_distance_matrix(df)
+        
+        # Initialize results dictionary
         results = {
-            "num_observations": n,
-            "num_parameters": m,
+            "num_observations": num_observations,
+            "num_parameters": num_parameters,
             "num_condition_equations": r,
+            "distance_matrix": distance_matrix.tolist(),
             "observation_data": df.to_dict(orient='records'),
-            "benchmark_data": [{"Point": f"B{i+1}", "Elevation": b} 
-                             for i, b in enumerate(data['benchmarks'])]
+            "benchmark_data": [{"Point": f"B{i+1}", "Elevation": b} for i, b in enumerate(benchmarks)]
         }
         
-        # Perform adjustment if needed
         if r > 0:
-            calc = AdjustmentCalculator(df, data['benchmarks'], data['formulas'])
-            adj_results = calc.perform_full_adjustment()
+            # Process formulas and create coefficient table
+            coefficient_table = []
+            modified_equations = []
             
-            if adj_results['v_table_from_inverse'] is None:
-                return jsonify({"error": "Matrix is singular - cannot compute adjustment"}), 400
+            for i, formula in enumerate(formulas):
+                modifiedEqn = modify_equation(formula)
+                modified_equations.append(modifiedEqn)
+                coeffs = extract_coefficients(modifiedEqn)
+                row = [f"Eqn {i+1}"] + [coeffs.get(j, '0') for j in range(1, num_observations + 1)]
+                coefficient_table.append(row)
             
-            # Add all adjustment results
-            results.update(adj_results)
-            results['distance_matrix'] = adj_results['distance_matrix'].tolist()
+            # Calculate weighted coefficient table
+            result_table = multiply_coefficients_with_distances(coefficient_table, distance_matrix)
+            w_values = calculate_w_values(formulas, df, benchmarks)
+            
+            for i, row in enumerate(result_table):
+                row.append(format_w_value(w_values[i]))
+            
+            # Calculate transposed matrix
+            transposed_table = transpose_coefficient_matrix(coefficient_table)
+            
+            # Calculate product table
+            product_table = multiply_result_table_with_transpose(result_table)
+            
+            # Calculate inverse of product table
+            inverse_table = calculate_inverse_of_product_table(product_table)
+            
+            # Calculate K values
+            v_table_from_inverse = None
+            residual = None
+            adjusted_heights = None
+            
+            if inverse_table:
+                w_values = [float(row[-1]) for row in result_table]
+                v_table_from_inverse = multiply_inverse_table_with_w(inverse_table, w_values)
+                
+                if v_table_from_inverse:
+                    residual = calculate_residual(distance_matrix, coefficient_table, v_table_from_inverse)
+                    
+                    if residual:
+                        adjusted_heights = calculate_adjusted_heights(df, residual)
+            
+            # Add all calculation results to the results dictionary
+            results.update({
+                "modified_equations": modified_equations,
+                "coefficient_table": coefficient_table,
+                "result_table": result_table,
+                "transposed_table": transposed_table,
+                "product_table": product_table,
+                "inverse_table": inverse_table,
+                "v_table_from_inverse": v_table_from_inverse,
+                "residual": residual,
+                "adjusted_heights": adjusted_heights
+            })
         
         return jsonify(results), 200
         
     except Exception as e:
+        # Log the error (in a production environment you'd use a proper logger)
+        print(f"Error: {str(e)}")
         return jsonify({"error": str(e)}), 500
-
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
