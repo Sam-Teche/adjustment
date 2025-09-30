@@ -170,7 +170,7 @@ def calculate_inverse_of_product_table(product_table):
                 if abs(val) < 1e-10:
                     formatted_row.append("0")
                 else:
-                    formatted_row.append(f"+{val:.6f}" if val >= 0 else f"{val:.6f}")
+                    formatted_row.append(f"+{val:.4f}" if val >= 0 else f"{val:.4f}")
             inverse_table.append(formatted_row)
         
         return inverse_table
@@ -204,7 +204,7 @@ def multiply_inverse_table_with_w(inverse_table, w_values):
         if abs(val) < 1e-10:
             formatted_result.append(["K" + str(i+1), "0"])
         else:
-            formatted_result.append(["K" + str(i+1), f"+{val:.8f}" if val >= 0 else f"{val:.8f}"])
+            formatted_result.append(["K" + str(i+1), f"+{val:.4f}" if val >= 0 else f"{val:.4f}"])
     
     return formatted_result
 
@@ -307,7 +307,7 @@ def calculate_residual(distance_matrix, coefficient_table, formatted_result):
         if abs(val) < 1e-10:
             residual.append(["Residual " + str(i+1), "0"])
         else:
-            residual.append(["Residual " + str(i+1), f"+{val:.8f}" if val >= 0 else f"{val:.8f}"])
+            residual.append(["Residual " + str(i+1), f"+{val:.4f}" if val >= 0 else f"{val:.4f}"])
     
     return residual
 
@@ -328,14 +328,9 @@ def calculate_adjusted_heights(df, residual):
     for i in range(len(df)):
         h_obs = df['h_obs'].iloc[i]
         adjusted_height = h_obs + residual_values[i]
-        adjusted_heights.append([f"Adjusted Height {i+1}", f"{adjusted_height:.6f}"])
+        adjusted_heights.append([f"Adjusted Height {i+1}", f"{adjusted_height:.4f}"])
     
     return adjusted_heights
-
-
-@app.route('/')
-def index():
-    return render_template('index.html')
 
 
 
